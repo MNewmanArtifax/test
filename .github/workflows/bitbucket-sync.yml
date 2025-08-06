@@ -1,1 +1,331 @@
+name: Full Mirror Sync from Bitbucket
+on:
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: 'Use force push (destructive - will overwrite GitHub history)'
+        required: false
+        default: false
+        type: boolean
+      delete_extra_branches:
+        description: 'Delete branches that exist on GitHub but not on Bitbucket'
+        required: false
+        default: false
+        type: boolean
+      preserve_workflows:
+        description: 'Preserve .github/workflows folder on master branch'
+        required: false
+        default: true
+        type: boolean
 
+jobs:
+  full-mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_PAT: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Set up Git config
+        run: |
+          git config --global user.name "GitHub Action Full Mirror Bot"
+          git config --global user.email "actions@git-mirror.com"
+
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Add Bitbucket remote
+        run: |
+          git remote add bitbucket https://$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD@bitbucket.org/GrosvenorSystems/propman.git
+        env:
+          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_USERNAME }}
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+
+      - name: Fetch all branches and tags from Bitbucket
+        run: |
+          echo "🔍 Fetching all branches and tags from Bitbucket..."
+          git fetch bitbucket "+refs/heads/*:refs/remotes/bitbucket/*"
+          git fetch bitbucket "+refs/tags/*:refs/tags/*"
+          echo "✅ Fetch complete"
+
+      - name: Confirm GITHUB_TOKEN availability
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "❌ GITHUB_TOKEN is not set."
+            exit 1
+          else
+            echo "✅ GITHUB_TOKEN is available."
+          fi
+
+      - name: Backup protected folders (if enabled)
+        if: ${{ github.event.inputs.preserve_workflows == 'true' }}
+        run: |
+          echo "📁 Backing up protected folders from current GitHub state..."
+          mkdir -p _preserve
+          
+          # Make sure we're on GitHub's master/main to backup from the right place
+          git checkout master 2>/dev/null || git checkout main 2>/dev/null || echo "No master/main branch found"
+          
+          # Backup .github/workflows if it exists
+          if [ -d ".github/workflows" ]; then
+            cp -r .github/workflows _preserve/
+            echo "  ✓ Backed up .github/workflows from GitHub"
+            echo "  📋 Backed up files:"
+            ls -la _preserve/workflows/
+          else
+            echo "  ⚠️  .github/workflows not found on GitHub master"
+          fi
+
+      - name: Mirror all Bitbucket branches to GitHub
+        run: |
+          SYNCED_COUNT=0
+          FAILED_COUNT=0
+          TOTAL_COMMITS=0
+          PROTECTED_RESTORED=false
+          FORCE_PUSH="${{ github.event.inputs.force_push }}"
+          PRESERVE_WORKFLOWS="${{ github.event.inputs.preserve_workflows }}"
+          
+          echo "🔍 Starting full mirror sync at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⚙️  Configuration:"
+          echo "   Force push: $FORCE_PUSH"
+          echo "   Preserve workflows: $PRESERVE_WORKFLOWS"
+          echo "   Delete extra branches: ${{ github.event.inputs.delete_extra_branches }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          TOTAL_BRANCHES=$(git for-each-ref --format='%(refname:strip=3)' refs/remotes/bitbucket/ | wc -l)
+          echo "📊 Found $TOTAL_BRANCHES branches in Bitbucket to mirror"
+          echo ""
+          
+          # Write branch info to temporary file
+          git for-each-ref --format='%(refname:strip=3) %(committerdate:iso8601)' refs/remotes/bitbucket/ > branch_list.txt
+          
+          while IFS= read -r line; do
+            BRANCH=$(echo "$line" | cut -d' ' -f1)
+            DATE=$(echo "$line" | cut -d' ' -f2-)
+            
+            # Skip internal branches
+            if [ "$BRANCH" = "sync" ] || [ "$BRANCH" = "HEAD" ]; then
+              echo "🔁 Skipping $BRANCH branch (internal branch)"
+              continue
+            fi
+            
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🔄 Processing branch: $BRANCH"
+            echo "📅 Last updated: $(date -d "$DATE" +'%Y-%m-%d %H:%M:%S')"
+            if [ "$BRANCH" = "master" ] && [ "$PRESERVE_WORKFLOWS" = "true" ]; then
+              echo "⚠️  Master branch - protected folders will be restored"
+            fi
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            echo "🔀 Checking out $BRANCH from Bitbucket..."
+            git checkout -B "$BRANCH" "bitbucket/$BRANCH"
+            
+            # Count commits for reporting
+            if git rev-parse --verify origin/"$BRANCH" >/dev/null 2>&1; then
+              # Branch exists on GitHub
+              if [ "$FORCE_PUSH" = "true" ]; then
+                TOTAL_COMMITS_BRANCH=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+                echo "🔄 Force push enabled - will overwrite with $TOTAL_COMMITS_BRANCH commit(s)"
+              else
+                NEW_COMMITS=$(git rev-list --count origin/"$BRANCH"..HEAD 2>/dev/null || echo "0")
+                if [ "$NEW_COMMITS" -gt 0 ]; then
+                  echo "📈 Found $NEW_COMMITS new commit(s) to sync"
+                else
+                  echo "📊 Branch is up to date (0 new commits)"
+                fi
+                TOTAL_COMMITS_BRANCH=$NEW_COMMITS
+              fi
+            else
+              # New branch
+              TOTAL_COMMITS_BRANCH=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+              echo "🆕 New branch with $TOTAL_COMMITS_BRANCH commit(s)"
+            fi
+            
+            # Restore protected folders on master branch if enabled
+            if [ "$BRANCH" = "master" ] && [ "$PRESERVE_WORKFLOWS" = "true" ]; then
+              echo "♻️  Restoring protected folders for master branch..."
+              RESTORED=false
+              
+              # Restore workflows from backup
+              if [ -d "_preserve/workflows" ]; then
+                mkdir -p .github
+                cp -r _preserve/workflows .github/
+                echo "  ✓ Restored .github/workflows"
+                echo "  📋 Restored files:"
+                ls -la .github/workflows/
+                RESTORED=true
+              else
+                echo "  ⚠️  No workflows backup found to restore"
+              fi
+              
+              if [ "$RESTORED" = true ]; then
+                git add .
+                if git diff --staged --quiet; then
+                  echo "  ↪ No changes to commit (files already match)"
+                else
+                  git commit -m "🛡️ Restore protected files (.github/workflows)"
+                  echo "  ✅ Committed restored protected folders"
+                  PROTECTED_RESTORED=true
+                fi
+              fi
+            fi
+            
+            # Determine push strategy
+            if [ "$FORCE_PUSH" = "true" ]; then
+              PUSH_ARGS="--force"
+              echo "📤 Force pushing to GitHub..."
+            else
+              PUSH_ARGS="--force-with-lease"
+              echo "📤 Pushing to GitHub with lease protection..."
+            fi
+            
+            # Push to GitHub
+            if git push "https://x-access-token:${GH_PAT}@github.com/grosvenorsystems/propman.git" HEAD:refs/heads/"$BRANCH" $PUSH_ARGS 2>&1 | tee push_output.txt; then
+              echo "✅ Successfully synced $BRANCH"
+              SYNCED_COUNT=$((SYNCED_COUNT + 1))
+              TOTAL_COMMITS=$((TOTAL_COMMITS + TOTAL_COMMITS_BRANCH))
+            else
+              echo "❌ Failed to sync $BRANCH"
+              echo "Error details:"
+              cat push_output.txt
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+            rm -f push_output.txt
+          done < branch_list.txt
+          
+          # Clean up temporary file
+          rm -f branch_list.txt
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 MIRROR SYNC SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Synced: $SYNCED_COUNT branches"
+          echo "📝 Total commits: $TOTAL_COMMITS"
+          echo "❌ Failed: $FAILED_COUNT branches"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛡️  PROTECTED FOLDERS STATUS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          if [ "$PRESERVE_WORKFLOWS" = "true" ]; then
+            if [ "$PROTECTED_RESTORED" = true ]; then
+              echo "♻️  Protected files: Successfully restored ✓"
+            elif [ "$SYNCED_COUNT" -gt 0 ]; then
+              echo "♻️  Protected files: Not needed (master not synced) ✓"
+            else
+              echo "♻️  Protected files: No branches synced"
+            fi
+          else
+            echo "♻️  Protected files: Preservation disabled"
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo ""
+            echo "⚠️  WARNING: Some branches failed to sync!"
+            exit 1
+          fi
+
+      - name: Sync tags from Bitbucket
+        run: |
+          echo ""
+          echo "🏷️  Syncing tags from Bitbucket..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          TAG_COUNT=0
+          FAILED_TAGS=0
+          FORCE_PUSH="${{ github.event.inputs.force_push }}"
+          
+          # Get all tags from Bitbucket
+          git tag -l > bitbucket_tags.txt
+          
+          if [ -s bitbucket_tags.txt ]; then
+            echo "📊 Found $(wc -l < bitbucket_tags.txt) tags to sync"
+            
+            while IFS= read -r TAG; do
+              echo "🏷️  Syncing tag: $TAG"
+              
+              if [ "$FORCE_PUSH" = "true" ]; then
+                PUSH_ARGS="--force"
+              else
+                PUSH_ARGS=""
+              fi
+              
+              if git push "https://x-access-token:${GH_PAT}@github.com/grosvenorsystems/propman.git" refs/tags/"$TAG":refs/tags/"$TAG" $PUSH_ARGS 2>&1; then
+                echo "  ✅ Successfully synced tag $TAG"
+                TAG_COUNT=$((TAG_COUNT + 1))
+              else
+                echo "  ❌ Failed to sync tag $TAG"
+                FAILED_TAGS=$((FAILED_TAGS + 1))
+              fi
+            done < bitbucket_tags.txt
+            
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🏷️  TAG SYNC SUMMARY"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ Synced: $TAG_COUNT tags"
+            echo "❌ Failed: $FAILED_TAGS tags"
+          else
+            echo "📝 No tags found in Bitbucket repository"
+          fi
+          
+          rm -f bitbucket_tags.txt
+
+      - name: Delete extra branches from GitHub (if enabled)
+        if: ${{ github.event.inputs.delete_extra_branches == 'true' }}
+        run: |
+          echo ""
+          echo "🗑️  Checking for extra branches to delete..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          DELETED_COUNT=0
+          FAILED_DELETES=0
+          
+          # Get all Bitbucket branches
+          git for-each-ref --format='%(refname:strip=3)' refs/remotes/bitbucket/ | grep -v "^HEAD$" > bitbucket_branches.txt
+          
+          # Get all GitHub branches
+          git ls-remote --heads origin | cut -d$'\t' -f2 | sed 's|refs/heads/||' > github_branches.txt
+          
+          # Find branches that exist on GitHub but not on Bitbucket
+          while IFS= read -r GITHUB_BRANCH; do
+            if ! grep -q "^$GITHUB_BRANCH$" bitbucket_branches.txt; then
+              echo "🗑️  Deleting extra branch: $GITHUB_BRANCH"
+              
+              if git push "https://x-access-token:${GH_PAT}@github.com/grosvenorsystems/propman.git" --delete "$GITHUB_BRANCH" 2>&1; then
+                echo "  ✅ Successfully deleted $GITHUB_BRANCH"
+                DELETED_COUNT=$((DELETED_COUNT + 1))
+              else
+                echo "  ❌ Failed to delete $GITHUB_BRANCH"
+                FAILED_DELETES=$((FAILED_DELETES + 1))
+              fi
+            fi
+          done < github_branches.txt
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️  BRANCH CLEANUP SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️  Deleted: $DELETED_COUNT branches"
+          echo "❌ Failed: $FAILED_DELETES deletions"
+          
+          rm -f bitbucket_branches.txt github_branches.txt
+          
+          if [ "$FAILED_DELETES" -gt 0 ]; then
+            echo ""
+            echo "⚠️  WARNING: Some branch deletions failed!"
+          fi
+
+      - name: Final Summary
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 FULL MIRROR SYNC COMPLETE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🕐 Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "📦 Repository: Bitbucket → GitHub"
+          echo "🔄 Sync type: Full mirror"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "✅ Your GitHub repository is now an exact mirror of Bitbucket!"
+          echo "📝 Check the logs above for detailed sync results."
