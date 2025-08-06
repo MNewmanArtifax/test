@@ -1,0 +1,219 @@
+name: Sync from Bitbucket
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Run daily at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_PAT: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Set up Git config
+        run: |
+          git config --global user.name "GitHub Action Sync Bot"
+          git config --global user.email "actions@git-sync.com"
+
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Add Bitbucket remote
+        run: |
+          git remote add bitbucket https://$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD@bitbucket.org/GrosvenorSystems/propman.git
+        env:
+          BITBUCKET_USERNAME: ${{ secrets.BITBUCKET_USERNAME }}
+          BITBUCKET_APP_PASSWORD: ${{ secrets.BITBUCKET_APP_PASSWORD }}
+
+      - name: Fetch all branches from Bitbucket
+        run: |
+          git fetch bitbucket "+refs/heads/*:refs/remotes/bitbucket/*"
+
+      - name: Confirm GITHUB_TOKEN availability
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "❌ GITHUB_TOKEN is not set."
+            exit 1
+          else
+            echo "✅ GITHUB_TOKEN is available."
+          fi
+
+      # Always backup protected folders first, regardless of branch processing
+      - name: Backup protected folders from GitHub
+        run: |
+          echo "📁 Backing up protected folders from current GitHub state..."
+          mkdir -p _preserve
+          
+          # Make sure we're on GitHub's master to backup from the right place
+          git checkout master 2>/dev/null || git checkout main 2>/dev/null || echo "No master/main branch found"
+          
+          # Backup .github/workflows if it exists
+          if [ -d ".github/workflows" ]; then
+            cp -r .github/workflows _preserve/
+            echo "  ✓ Backed up .github/workflows from GitHub"
+            echo "  📋 Backed up files:"
+            ls -la _preserve/workflows/
+          else
+            echo "  ⚠️  .github/workflows not found on GitHub master"
+          fi
+
+      - name: Mirror only recently updated Bitbucket branches to GitHub
+        run: |
+          NOW=$(date +%s)
+          SYNCED_COUNT=0
+          SKIPPED_COUNT=0
+          FAILED_COUNT=0
+          TOTAL_COMMITS=0
+          PROTECTED_RESTORED=false
+          
+          echo "🔍 Starting sync process at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          TOTAL_BRANCHES=$(git for-each-ref --format='%(refname:strip=3)' refs/remotes/bitbucket/ | wc -l)
+          echo "📊 Found $TOTAL_BRANCHES branches in Bitbucket"
+          echo ""
+          
+          # Write branch info to temporary file to avoid subshell issue
+          git for-each-ref --format='%(refname:strip=3) %(committerdate:iso8601)' refs/remotes/bitbucket/ > branch_list.txt
+          
+          while IFS= read -r line; do
+            BRANCH=$(echo "$line" | cut -d' ' -f1)
+            DATE=$(echo "$line" | cut -d' ' -f2-)
+            TS=$(date -d "$DATE" +%s)
+            AGE=$(( (NOW - TS) / 86400 ))
+            
+            if [ "$AGE" -ge 1 ]; then
+              echo "⏭️  Skipping $BRANCH (last updated $AGE days ago on $(date -d "$DATE" +'%Y-%m-%d'))"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+            
+            if [ "$BRANCH" = "sync" ] || [ "$BRANCH" = "HEAD" ]; then
+              echo "🔁 Skipping $BRANCH branch (internal branch)"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+            
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🔄 Processing branch: $BRANCH"
+            echo "📅 Last updated: $(date -d "$DATE" +'%Y-%m-%d %H:%M:%S')"
+            if [ "$BRANCH" = "master" ]; then
+              echo "⚠️  Master branch will be synced - protected folders will be restored"
+            fi
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            echo "🔀 Checking out $BRANCH from Bitbucket..."
+            git checkout -B "$BRANCH" "bitbucket/$BRANCH"
+            
+            # Count new commits being synced
+            if git rev-parse --verify origin/"$BRANCH" >/dev/null 2>&1; then
+              # Branch exists on GitHub, count new commits
+              NEW_COMMITS=$(git rev-list --count origin/"$BRANCH"..HEAD 2>/dev/null || echo "0")
+              if [ "$NEW_COMMITS" -gt 0 ]; then
+                echo "📈 Found $NEW_COMMITS new commit(s) to sync"
+              else
+                echo "📊 Branch is up to date (0 new commits)"
+              fi
+            else
+              # New branch - find commits unique to this branch
+              BASE_BRANCH=""
+              if git rev-parse --verify origin/master >/dev/null 2>&1; then
+                BASE_BRANCH="origin/master"
+              elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+                BASE_BRANCH="origin/main"
+              fi
+              
+              if [ -n "$BASE_BRANCH" ]; then
+                MERGE_BASE=$(git merge-base HEAD "$BASE_BRANCH" 2>/dev/null || echo "")
+                if [ -n "$MERGE_BASE" ]; then
+                  NEW_COMMITS=$(git rev-list --count "$MERGE_BASE"..HEAD 2>/dev/null || echo "0")
+                  echo "🆕 New branch with $NEW_COMMITS unique commit(s) (since $BASE_BRANCH)"
+                else
+                  NEW_COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+                  echo "🆕 New branch with $NEW_COMMITS commit(s) (total)"
+                fi
+              else
+                NEW_COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+                echo "🆕 New branch with $NEW_COMMITS commit(s) (no base branch found)"
+              fi
+            fi
+            
+            # Restore protected folders on master branch from our backup
+            if [ "$BRANCH" = "master" ]; then
+              echo "♻️  Restoring protected folders for master branch..."
+              RESTORED=false
+              
+              # Restore workflows from backup
+              if [ -d "_preserve/workflows" ]; then
+                mkdir -p .github
+                cp -r _preserve/workflows .github/
+                echo "  ✓ Restored .github/workflows"
+                echo "  📋 Restored files:"
+                ls -la .github/workflows/
+                RESTORED=true
+              else
+                echo "  ⚠️  No workflows backup found to restore"
+              fi
+              
+              if [ "$RESTORED" = true ]; then
+                git add .
+                if git diff --staged --quiet; then
+                  echo "  ↪ No changes to commit (files already match)"
+                else
+                  git commit -m "🛡️ Restore protected files (.github/workflows)"
+                  echo "  ✅ Committed restored protected folders"
+                  PROTECTED_RESTORED=true
+                fi
+              fi
+            fi
+            
+            echo "📤 Pushing to GitHub..."
+            if git push "https://x-access-token:${GH_PAT}@github.com/grosvenorsystems/propman.git" HEAD:refs/heads/"$BRANCH" --force-with-lease 2>&1 | tee push_output.txt; then
+              echo "✅ Successfully synced $BRANCH"
+              SYNCED_COUNT=$((SYNCED_COUNT + 1))
+              TOTAL_COMMITS=$((TOTAL_COMMITS + NEW_COMMITS))
+            else
+              echo "❌ Failed to sync $BRANCH"
+              echo "Error details:"
+              cat push_output.txt
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+            rm -f push_output.txt
+          done < branch_list.txt
+          
+          echo "🔍 DEBUG: Finished processing all branches, moving to cleanup..."
+          
+          # Always clean up temporary file, even if there are errors
+          rm -f branch_list.txt
+          
+          echo "🔍 DEBUG: Cleaned up branch_list.txt, generating summary..."
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 SYNC SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Synced: $SYNCED_COUNT branches"
+          echo "📝 Total commits: $TOTAL_COMMITS"
+          echo "⏭️  Skipped: $SKIPPED_COUNT branches"
+          echo "❌ Failed: $FAILED_COUNT branches"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🛡️  PROTECTED FOLDERS STATUS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          if [ "$PROTECTED_RESTORED" = true ]; then
+            echo "♻️  Protected files: Successfully restored ✓"
+          elif [ "$SYNCED_COUNT" -gt 0 ]; then
+            echo "♻️  Protected files: Not needed (master not synced) ✓"
+          else
+            echo "♻️  Protected files: No branches synced"
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🏁 Sync completed at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo ""
+            echo "⚠️  WARNING: Some branches failed to sync!"
+            exit 1
+          fi
