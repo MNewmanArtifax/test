@@ -171,7 +171,7 @@ jobs:
             fi
             
             echo "📤 Pushing to GitHub..."
-            if git push "https://x-access-token:${GH_PAT}@github.com/grosvenorsystems/propman.git" HEAD:refs/heads/"$BRANCH" --force-with-lease 2>&1 | tee push_output.txt; then
+            if git push "https://x-access-token:${GH_PAT}@github.com/artifax-development/artifax-event-public.git" HEAD:refs/heads/"$BRANCH" --force-with-lease 2>&1 | tee push_output.txt; then
               echo "✅ Successfully synced $BRANCH"
               SYNCED_COUNT=$((SYNCED_COUNT + 1))
               TOTAL_COMMITS=$((TOTAL_COMMITS + NEW_COMMITS))
